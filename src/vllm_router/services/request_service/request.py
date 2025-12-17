@@ -224,7 +224,7 @@ async def route_general_request(
             )
 
     service_discovery = get_service_discovery()
-    endpoints = service_discovery.get_endpoint_info()
+    endpoints = service_discovery.get_endpoint_info(request=request)
 
     aliases = getattr(service_discovery, "aliases", None)
     if aliases and requested_model in aliases.keys():

@@ -37,6 +37,7 @@ _global_service_discovery: "Optional[ServiceDiscovery]" = None
 class ServiceDiscoveryType(enum.Enum):
     STATIC = "static"
     K8S = "k8s"
+    H2O = "h2o"
 
 
 @dataclass
@@ -1279,6 +1280,16 @@ def _create_service_discovery(
             return K8sServiceNameServiceDiscovery(*args, **kwargs)
         else:
             return K8sPodIPServiceDiscovery(*args, **kwargs)
+    elif service_discovery_type == ServiceDiscoveryType.H2O:
+        k8s_discovery_type = kwargs.pop("k8s_service_discovery_type", "pod-ip")
+        if k8s_discovery_type is None or not k8s_discovery_type.strip():
+            normalized_type = "pod-ip"
+        else:
+            normalized_type = k8s_discovery_type.strip().lower()
+
+        assert normalized_type == "pod-ip", "H2O service discovery only supports pod-ip type"
+
+        return H2OK8sPodIPServiceDiscovery(*args, **kwargs)
     else:
         raise ValueError("Invalid service discovery type")
 
@@ -1346,12 +1357,499 @@ def get_service_discovery() -> ServiceDiscovery:
 
     return _global_service_discovery
 
+class H2OK8sPodIPServiceDiscovery(ServiceDiscovery):
+    def __init__(
+        self,
+        app,
+        namespace: str,
+        port: str,
+        label_selector=None,
+        prefill_model_labels: List[str] | None = None,
+        decode_model_labels: List[str] | None = None,
+        watcher_timeout_seconds: int = 0,
+        health_check_timeout_seconds: int = 10,
+    ):
+        """
+        Initialize the Kubernetes service discovery module. This module
+        assumes all serving engine pods are in the same namespace, listening
+        on the same port, and have the same label selector.
+
+        It will start a daemon thread to watch the engine pods and update
+        the url of the available engines.
+
+        Args:
+            namespace: the namespace of the engine pods
+            port: the port of the engines
+            label_selector: the label selector of the engines
+            watcher_timeout_seconds: timeout in seconds for Kubernetes watcher streams (default: 0)
+        """
+        self.app = app
+        self.namespace = namespace
+        self.port = port
+        self.available_engines: Dict[str, EndpointInfo] = {}
+        self.token_hash_engines: Dict[str, List[EndpointInfo]] = {}
+        self.available_engines_lock = threading.Lock()
+        self.known_models: Set[str] = set()
+        self.known_models_lock = threading.Lock()
+        self.label_selector = label_selector
+        self.watcher_timeout_seconds = watcher_timeout_seconds
+        self.health_check_timeout_seconds = health_check_timeout_seconds
+
+        # Init kubernetes watcher
+        try:
+            config.load_incluster_config()
+        except config.ConfigException:
+            config.load_kube_config()
+
+        self.k8s_api = client.CoreV1Api()
+        self.k8s_watcher = watch.Watch()
+
+        # Start watching engines
+        self.running = True
+        self.watcher_thread = threading.Thread(target=self._watch_engines, daemon=True)
+        self.watcher_thread.start()
+        self.prefill_model_labels = prefill_model_labels
+        self.decode_model_labels = decode_model_labels
+
+    @staticmethod
+    def _check_pod_ready(container_statuses):
+        """
+        Check if all containers in the pod are ready by reading the
+        k8s container statuses.
+        """
+        if not container_statuses:
+            return False
+        ready_count = sum(1 for status in container_statuses if status.ready)
+        return ready_count == len(container_statuses)
+
+    @staticmethod
+    def _is_pod_terminating(pod):
+        """
+        Check if the pod is in terminating state by checking
+        deletion timestamp.
+        """
+        return pod.metadata.deletion_timestamp is not None
+
+    def _get_engine_sleep_status(self, pod_ip) -> Optional[bool]:
+        """
+        Get the engine sleeping status by querying the engine's
+        '/is_sleeping' endpoint.
+
+        Args:
+            pod_ip: the IP address of the pod running the engine
+
+        Returns:
+            the sleep status of the target engine
+        """
+        url = f"http://{pod_ip}:{self.port}/is_sleeping"
+        try:
+            # TODO: should we add extra auth headers and start vllm with api key?
+            response = requests.get(
+                url, timeout=self.health_check_timeout_seconds
+            )
+            response.raise_for_status()
+            sleep = response.json()["is_sleeping"]
+            return sleep
+        except Exception as e:
+            logger.warning(
+                f"Failed to get the sleep status for engine at {url} - sleep status is set to `False`: {e}"
+            )
+            return False
+
+    def _check_engine_sleep_mode(self, pod_name) -> Optional[bool]:
+        try:
+            enable_sleep_mode = False
+            pod = self.k8s_api.read_namespaced_pod(
+                name=pod_name, namespace=self.namespace
+            )
+            for container in pod.spec.containers:
+                if container.name == "vllm":
+                    if (
+                        not container.command
+                        or "--enable-sleep-mode" in container.command
+                    ):
+                        enable_sleep_mode = True
+                    break
+            return enable_sleep_mode
+        except client.rest.ApiException as e:
+            logger.error(
+                f"Error checking if sleep-mode is enable for pod {pod_name}: {e}"
+            )
+            return False
+
+    def add_sleep_label(self, pod_name):
+        try:
+            pod = self.k8s_api.read_namespaced_pod(
+                name=pod_name, namespace=self.namespace
+            )
+            # pod.metadata.labels = {"sleeping": "true"}
+            pod.metadata.labels.update({"sleeping": "true"})
+            self.k8s_api.patch_namespaced_pod(
+                name=pod_name, namespace=self.namespace, body=pod
+            )
+            logger.info(f"Sleeping label added to the pod: {pod_name}")
+
+        except client.rest.ApiException as e:
+            logger.error(f"Error adding sleeping label to the pod {pod_name}: {e}")
+
+    def remove_sleep_label(self, pod_name):
+        try:
+            label_key = "sleeping"
+            body = {"metadata": {"labels": {label_key: None}}}
+
+            pod = self.k8s_api.read_namespaced_pod(
+                name=pod_name, namespace=self.namespace
+            )
+            if label_key in pod.metadata.labels:
+                self.k8s_api.patch_namespaced_pod(
+                    name=pod_name, namespace=self.namespace, body=body
+                )
+                logger.info(f"Label `sleeping=true` removed from pod '{pod_name}'")
+            else:
+                logger.info(
+                    f"Label `sleeping=true` not found on pod '{pod_name}' in namespace '{self.namespace}'"
+                )
+
+        except client.rest.ApiException as e:
+            logger.error(f"Error removing sleeping label: {e}")
+
+    def _get_model_names(self, pod_ip) -> List[str]:
+        """
+        Get the model names of the serving engine pod by querying the pod's
+        '/v1/models' endpoint.
+
+        Args:
+            pod_ip: the IP address of the pod
+
+        Returns:
+            List of model names available on the serving engine, including both base models and adapters
+        """
+        url = f"http://{pod_ip}:{self.port}/v1/models"
+        try:
+            response = requests.get(
+                url, timeout=self.health_check_timeout_seconds
+            )
+            response.raise_for_status()
+            models = response.json()["data"]
+
+            # Collect all model names, including both base models and adapters
+            model_names = []
+            for model in models:
+                model_id = model["id"]
+                model_names.append(model_id)
+
+            logger.info(f"Found models on pod {pod_ip}: {model_names}")
+            return model_names
+        except Exception as e:
+            logger.error(f"Failed to get model names from {url}: {e}")
+            return []
+
+    def _get_model_info(self, pod_ip) -> Dict[str, ModelInfo]:
+        """
+        Get detailed model information from the serving engine pod.
+
+        Args:
+            pod_ip: the IP address of the pod
+
+        Returns:
+            Dictionary mapping model IDs to their ModelInfo objects, including parent-child relationships
+        """
+        url = f"http://{pod_ip}:{self.port}/v1/models"
+        try:
+            response = requests.get(
+                url, timeout=self.health_check_timeout_seconds
+            )
+            response.raise_for_status()
+            models = response.json()["data"]
+            # Create a dictionary of model information
+            model_info = {}
+            for model in models:
+                model_id = model["id"]
+                model_info[model_id] = ModelInfo.from_dict(model)
+
+            return model_info
+        except Exception as e:
+            logger.error(f"Failed to get model info from {url}: {e}")
+            return {}
+
+    def _get_model_label(self, pod) -> Optional[str]:
+        """
+        Get the model label from the pod's metadata labels.
+
+        Args:
+            pod: The Kubernetes pod object
+
+        Returns:
+            The model label if found, None otherwise
+        """
+        if not pod.metadata.labels:
+            return None
+        return pod.metadata.labels.get("model")
+    
+    def _get_model_token_hash(self, pod) -> Optional[str]:
+        """
+        Get the model token hash from the pod's metadata annotations.
+
+        Args:
+            pod: The Kubernetes pod object
+
+        Returns:
+            The model token hash if found, None otherwise
+        """
+        if not pod.metadata.annotations:
+            return None
+        return pod.metadata.annotations.get("tokenHash")
+
+    def _watch_engines(self):
+        while self.running:
+            try:
+                for event in self.k8s_watcher.stream(
+                    self.k8s_api.list_namespaced_pod,
+                    namespace=self.namespace,
+                    label_selector=self.label_selector,
+                    timeout_seconds=self.watcher_timeout_seconds,
+                ):
+                    pod = event["object"]
+                    event_type = event["type"]
+                    
+                    pod_name = pod.metadata.name
+                    pod_ip = pod.status.pod_ip
+
+                    if event_type == "DELETED":
+                        if pod_name in self.available_engines:
+                            self._delete_engine(pod_name)
+                        continue
+
+                    # Check if pod is terminating
+                    is_pod_terminating = self._is_pod_terminating(pod)
+                    is_container_ready = self._check_pod_ready(
+                        pod.status.container_statuses
+                    )
+
+                    # Pod is ready if container is ready and pod is not terminating
+                    is_pod_ready = is_container_ready and not is_pod_terminating
+
+                    if is_pod_ready:
+                        model_names = self._get_model_names(pod_ip)
+                        model_label = self._get_model_label(pod)
+                        model_token_hash = self._get_model_token_hash(pod)
+                    else:
+                        model_names = []
+                        model_label = None
+                        model_token_hash = None
+                    # Record pod status for debugging
+                    if is_container_ready and is_pod_terminating:
+                        logger.info(
+                            f"Pod {pod_name} has ready containers but is terminating - marking as unavailable"
+                        )
+
+                    self._on_engine_update(
+                        pod_name,
+                        pod_ip,
+                        event_type,
+                        is_pod_ready,
+                        model_names,
+                        model_label,
+                        model_token_hash
+                    )
+            except Exception as e:
+                logger.error(f"K8s watcher error: {e}")
+                time.sleep(0.5)
+
+    def _add_engine(
+        self, engine_name: str, engine_ip: str, model_names: List[str], model_label: str, model_token_hash: Optional[str] = None
+    ):
+        logger.info(
+            f"Discovered new serving engine {engine_name} at "
+            f"{engine_ip}, running models: {model_names}"
+        )
+
+        # Get detailed model information
+        model_info = self._get_model_info(engine_ip)
+
+        # Check if engine is enabled with sleep mode and set engine sleep status
+        if self._check_engine_sleep_mode(engine_name):
+            sleep_status = self._get_engine_sleep_status(engine_ip)
+        else:
+            sleep_status = False
+
+        with self.available_engines_lock:
+            self.available_engines[engine_name] = EndpointInfo(
+                url=f"http://{engine_ip}:{self.port}",
+                model_names=model_names,
+                added_timestamp=int(time.time()),
+                Id=str(uuid.uuid5(uuid.NAMESPACE_DNS, engine_name)),
+                model_label=model_label,
+                sleep=sleep_status,
+                pod_name=engine_name,
+                namespace=self.namespace,
+                model_info=model_info,
+            )
+
+            # Store model information in the endpoint info
+            self.available_engines[engine_name].model_info = model_info
+
+            if model_token_hash not in self.token_hash_engines:
+                self.token_hash_engines[model_token_hash] = []
+            self.token_hash_engines[model_token_hash].append(
+                self.available_engines[engine_name]
+            )
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self.initialize_client_sessions(),
+                self.app.state.event_loop,
+            )
+            fut.result()
+        except Exception as e:
+            logger.error(f"Error initializing client sessions: {e}")
+
+        # Track all models we've ever seen
+        with self.known_models_lock:
+            self.known_models.update(model_names)
+
+    def _delete_engine(self, engine_name: str):
+        logger.info(f"Serving engine {engine_name} is deleted")
+        with self.available_engines_lock:
+            item = self.available_engines.pop(engine_name)
+            for token_hash, engines in self.token_hash_engines.items():
+                if item in engines:
+                    engines.remove(item)
+                    if not engines:
+                        del self.token_hash_engines[token_hash]
+                    break
+            del item
+
+
+    def _on_engine_update(
+        self,
+        engine_name: str,
+        engine_ip: Optional[str],
+        event: str,
+        is_pod_ready: bool,
+        model_names: List[str],
+        model_label: Optional[str],
+        model_token_hash: Optional[str],
+    ) -> None:
+        if event == "ADDED":
+            if engine_ip is None:
+                return
+
+            if not is_pod_ready:
+                return
+
+            if not model_names:
+                return
+
+            self._add_engine(engine_name, engine_ip, model_names, model_label, model_token_hash)
+
+        elif event == "DELETED":
+            if engine_name not in self.available_engines:
+                return
+
+            self._delete_engine(engine_name)
+
+        elif event == "MODIFIED":
+            if engine_ip is None:
+                return
+
+            if is_pod_ready and model_names:
+                self._add_engine(engine_name, engine_ip, model_names, model_label, model_token_hash)
+                return
+
+            if (
+                not is_pod_ready or not model_names
+            ) and engine_name in self.available_engines:
+                self._delete_engine(engine_name)
+                return
+
+    def get_endpoint_info(self, **kwargs) -> List[EndpointInfo]:
+        """
+        Get the URLs of the serving engines that are available for
+        querying.
+
+        Returns:
+            a list of engine URLs
+        """
+        if "request" not in kwargs:
+            raise ValueError("Request context is required to get endpoint info")
+        if "Authorization" not in kwargs["request"].headers:
+            raise ValueError("Authorization header is required to get endpoint info")
+        auth_header = kwargs["request"].headers["Authorization"]
+        if not auth_header.startswith("Bearer "):
+            raise ValueError("Invalid Authorization header format")
+        token = auth_header[len("Bearer ") :].strip()
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        
+        with self.available_engines_lock:
+            return list(self.token_hash_engines[token_hash])
+
+    def get_health(self) -> bool:
+        """
+        Check if the service discovery module is healthy.
+
+        Returns:
+            True if the service discovery module is healthy, False otherwise
+        """
+        return self.watcher_thread.is_alive()
+
+    def close(self):
+        """
+        Close the service discovery module.
+        """
+        self.running = False
+        self.k8s_watcher.stop()
+        self.watcher_thread.join()
+
+    async def initialize_client_sessions(self) -> None:
+        """
+        Initialize aiohttp ClientSession objects for prefill and decode endpoints.
+        This must be called from an async context during app startup.
+        """
+        if (
+            self.prefill_model_labels is not None
+            and self.decode_model_labels is not None
+        ):
+            endpoint_infos = self.get_endpoint_info()
+            for endpoint_info in endpoint_infos:
+                if endpoint_info.model_label in self.prefill_model_labels:
+                    if (
+                        hasattr(self.app.state, "prefill_client")
+                        and self.app.state.prefill_client is not None
+                    ):
+                        await self.app.state.prefill_client.close()
+                    self.app.state.prefill_client = aiohttp.ClientSession(
+                        base_url=endpoint_info.url,
+                        timeout=aiohttp.ClientTimeout(total=None),
+                    )
+                elif endpoint_info.model_label in self.decode_model_labels:
+                    if (
+                        hasattr(self.app.state, "decode_client")
+                        and self.app.state.decode_client is not None
+                    ):
+                        await self.app.state.decode_client.close()
+                    self.app.state.decode_client = aiohttp.ClientSession(
+                        base_url=endpoint_info.url,
+                        timeout=aiohttp.ClientTimeout(total=None),
+                    )
+
+    def has_ever_seen_model(self, model_name: str) -> bool:
+        """Check if we've ever seen this model, even if currently scaled to zero."""
+        with self.known_models_lock:
+            return model_name in self.known_models
+
+    def get_known_models(self) -> Set[str]:
+        """Get all models that have ever been discovered."""
+        with self.known_models_lock:
+            return self.known_models.copy()
+
 
 if __name__ == "__main__":
     # Test the service discovery
     # k8s_sd = K8sServiceDiscovery("default", 8000, "release=test")
     initialize_service_discovery(
-        ServiceDiscoveryType.K8S,
+        ServiceDiscoveryType.H2O,
+        app=None,
         namespace="default",
         port=8000,
         label_selector="release=test",
