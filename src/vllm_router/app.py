@@ -162,9 +162,9 @@ def initialize_all(app: FastAPI, args):
             prefill_model_labels=args.prefill_model_labels,
             decode_model_labels=args.decode_model_labels,
         )
-    elif args.service_discovery == "k8s":
+    elif args.service_discovery in ["k8s", "h2o"]:
         initialize_service_discovery(
-            ServiceDiscoveryType.K8S,
+            ServiceDiscoveryType.K8S if args.service_discovery == "k8s" else ServiceDiscoveryType.H2O,
             k8s_service_discovery_type=args.k8s_service_discovery_type,
             app=app,
             namespace=args.k8s_namespace,

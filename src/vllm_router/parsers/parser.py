@@ -126,7 +126,7 @@ def parse_args():
     parser.add_argument(
         "--service-discovery",
         type=str,
-        choices=["static", "k8s"],
+        choices=["static", "k8s", "h2o"],
         help="The service discovery type.",
     )
     parser.add_argument(

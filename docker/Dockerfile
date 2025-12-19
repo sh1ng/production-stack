@@ -17,6 +17,7 @@ COPY src/ src/
 
 ARG INSTALL_OPTIONAL_DEP=semantic_cache,lmcache
 ENV INSTALL_OPTIONAL_DEP=${INSTALL_OPTIONAL_DEP}
+ENV SETUPTOOLS_SCM_PRETEND_VERSION_FOR_vllm_router=0.1.0
 
 # Install dependencies (use cache, and delete after install, to speed up the build)
 RUN pip install --no-cache-dir uv && \

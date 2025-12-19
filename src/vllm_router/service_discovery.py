@@ -1772,17 +1772,21 @@ class H2OK8sPodIPServiceDiscovery(ServiceDiscovery):
             a list of engine URLs
         """
         if "request" not in kwargs:
-            raise ValueError("Request context is required to get endpoint info")
-        if "Authorization" not in kwargs["request"].headers:
-            raise ValueError("Authorization header is required to get endpoint info")
-        auth_header = kwargs["request"].headers["Authorization"]
-        if not auth_header.startswith("Bearer "):
-            raise ValueError("Invalid Authorization header format")
-        token = auth_header[len("Bearer ") :].strip()
-        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-        
+            token_hash = None
+        else:
+            if "Authorization" not in kwargs["request"].headers:
+                raise ValueError("Authorization header is required to get endpoint info")
+            auth_header = kwargs["request"].headers["Authorization"]
+            if not auth_header.startswith("Bearer "):
+                raise ValueError("Invalid Authorization header format")
+            token = auth_header[len("Bearer ") :].strip()
+            token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+            
         with self.available_engines_lock:
-            return list(self.token_hash_engines[token_hash])
+            if token_hash:
+                return list(self.token_hash_engines[token_hash])
+            else:
+                return list(self.available_engines.values())
 
     def get_health(self) -> bool:
         """
