@@ -126,7 +126,7 @@ async def show_version():
 
 
 @main_router.get("/v1/models")
-async def show_models():
+async def show_models(request: Request):
     """
     Returns a list of all models available in the stack.
 
@@ -139,7 +139,7 @@ async def show_models():
     Raises:
         Exception: If there is an error in retrieving the endpoint information.
     """
-    endpoints = get_service_discovery().get_endpoint_info()
+    endpoints = get_service_discovery().get_endpoint_info(request=request)
     existing_models = set()
     model_cards = []
 
@@ -166,7 +166,7 @@ async def show_models():
 
 
 @main_router.get("/engines")
-async def get_engine_instances():
+async def get_engine_instances(request: Request):
     """
     Returns a list of all models available in the stack.
 
@@ -179,7 +179,7 @@ async def get_engine_instances():
     Raises:
         Exception: If there is an error in retrieving the endpoint information.
     """
-    endpoints = get_service_discovery().get_endpoint_info()
+    endpoints = get_service_discovery().get_endpoint_info(request=request)
     existing_engines = set()
     engines_cards = []
 

@@ -1287,7 +1287,9 @@ def _create_service_discovery(
         else:
             normalized_type = k8s_discovery_type.strip().lower()
 
-        assert normalized_type == "pod-ip", "H2O service discovery only supports pod-ip type"
+        assert (
+            normalized_type == "pod-ip"
+        ), "H2O service discovery only supports pod-ip type"
 
         return H2OK8sPodIPServiceDiscovery(*args, **kwargs)
     else:
@@ -1356,6 +1358,7 @@ def get_service_discovery() -> ServiceDiscovery:
         raise ValueError("Service discovery module not initialized")
 
     return _global_service_discovery
+
 
 class H2OK8sPodIPServiceDiscovery(ServiceDiscovery):
     def __init__(
@@ -1444,9 +1447,7 @@ class H2OK8sPodIPServiceDiscovery(ServiceDiscovery):
         url = f"http://{pod_ip}:{self.port}/is_sleeping"
         try:
             # TODO: should we add extra auth headers and start vllm with api key?
-            response = requests.get(
-                url, timeout=self.health_check_timeout_seconds
-            )
+            response = requests.get(url, timeout=self.health_check_timeout_seconds)
             response.raise_for_status()
             sleep = response.json()["is_sleeping"]
             return sleep
@@ -1526,9 +1527,7 @@ class H2OK8sPodIPServiceDiscovery(ServiceDiscovery):
         """
         url = f"http://{pod_ip}:{self.port}/v1/models"
         try:
-            response = requests.get(
-                url, timeout=self.health_check_timeout_seconds
-            )
+            response = requests.get(url, timeout=self.health_check_timeout_seconds)
             response.raise_for_status()
             models = response.json()["data"]
 
@@ -1556,9 +1555,7 @@ class H2OK8sPodIPServiceDiscovery(ServiceDiscovery):
         """
         url = f"http://{pod_ip}:{self.port}/v1/models"
         try:
-            response = requests.get(
-                url, timeout=self.health_check_timeout_seconds
-            )
+            response = requests.get(url, timeout=self.health_check_timeout_seconds)
             response.raise_for_status()
             models = response.json()["data"]
             # Create a dictionary of model information
@@ -1585,7 +1582,7 @@ class H2OK8sPodIPServiceDiscovery(ServiceDiscovery):
         if not pod.metadata.labels:
             return None
         return pod.metadata.labels.get("model")
-    
+
     def _get_model_token_hash(self, pod) -> Optional[str]:
         """
         Get the model token hash from the pod's metadata annotations.
@@ -1611,7 +1608,7 @@ class H2OK8sPodIPServiceDiscovery(ServiceDiscovery):
                 ):
                     pod = event["object"]
                     event_type = event["type"]
-                    
+
                     pod_name = pod.metadata.name
                     pod_ip = pod.status.pod_ip
 
@@ -1650,14 +1647,19 @@ class H2OK8sPodIPServiceDiscovery(ServiceDiscovery):
                         is_pod_ready,
                         model_names,
                         model_label,
-                        model_token_hash
+                        model_token_hash,
                     )
             except Exception as e:
                 logger.error(f"K8s watcher error: {e}")
                 time.sleep(0.5)
 
     def _add_engine(
-        self, engine_name: str, engine_ip: str, model_names: List[str], model_label: str, model_token_hash: Optional[str] = None
+        self,
+        engine_name: str,
+        engine_ip: str,
+        model_names: List[str],
+        model_label: str,
+        model_token_hash: Optional[str] = None,
     ):
         logger.info(
             f"Discovered new serving engine {engine_name} at "
@@ -1720,7 +1722,6 @@ class H2OK8sPodIPServiceDiscovery(ServiceDiscovery):
                     break
             del item
 
-
     def _on_engine_update(
         self,
         engine_name: str,
@@ -1741,7 +1742,9 @@ class H2OK8sPodIPServiceDiscovery(ServiceDiscovery):
             if not model_names:
                 return
 
-            self._add_engine(engine_name, engine_ip, model_names, model_label, model_token_hash)
+            self._add_engine(
+                engine_name, engine_ip, model_names, model_label, model_token_hash
+            )
 
         elif event == "DELETED":
             if engine_name not in self.available_engines:
@@ -1754,7 +1757,9 @@ class H2OK8sPodIPServiceDiscovery(ServiceDiscovery):
                 return
 
             if is_pod_ready and model_names:
-                self._add_engine(engine_name, engine_ip, model_names, model_label, model_token_hash)
+                self._add_engine(
+                    engine_name, engine_ip, model_names, model_label, model_token_hash
+                )
                 return
 
             if (
@@ -1771,22 +1776,19 @@ class H2OK8sPodIPServiceDiscovery(ServiceDiscovery):
         Returns:
             a list of engine URLs
         """
-        if "request" not in kwargs:
-            token_hash = None
-        else:
-            if "Authorization" not in kwargs["request"].headers:
-                raise ValueError("Authorization header is required to get endpoint info")
-            auth_header = kwargs["request"].headers["Authorization"]
-            if not auth_header.startswith("Bearer "):
-                raise ValueError("Invalid Authorization header format")
-            token = auth_header[len("Bearer ") :].strip()
-            token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-            
         with self.available_engines_lock:
-            if token_hash:
-                return list(self.token_hash_engines[token_hash])
-            else:
+            if "request" not in kwargs:
                 return list(self.available_engines.values())
+            else:
+                auth_header = kwargs["request"].headers.get("Authorization", None)
+                if auth_header and not auth_header.startswith("Bearer "):
+                    raise ValueError("Invalid Authorization header format")
+                token = auth_header[len("Bearer ") :].strip() if auth_header else None
+                token_hash = (
+                    hashlib.sha256(token.encode("utf-8")).hexdigest() if token else None
+                )
+
+                return list(self.token_hash_engines.get(token_hash, []))
 
     def get_health(self) -> bool:
         """
